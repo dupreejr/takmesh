@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+# install_tak22_serial_fix.sh
+# Installer for tak22 with serial retry logic, ensures user 'joseph' in dialout,
+# and provides an autostart helper command.
+set -euo pipefail
+
+BRIDGE_NAME="tak22"
+SERVICE_USER="joseph"
+INSTALL_DIR="/opt/${BRIDGE_NAME}"
+VENV_DIR="${INSTALL_DIR}/venv"
+BRIDGE_PY="${INSTALL_DIR}/bridge.py"
+WRAPPER="/usr/local/bin/${BRIDGE_NAME}"
+SERVICE_FILE="/etc/systemd/system/${BRIDGE_NAME}.service"
+AUTOSTART_HELPER="/usr/local/bin/${BRIDGE_NAME}-autostart"
+REQ_FILE="${INSTALL_DIR}/requirements.txt"
+
+# packages to install (best-effort)
+PKGS=( python3 python3-venv python3-pip ca-certificates git )
+
+echo "=== tak22 installer (serial retry + dialout check + autostart helper) ==="
+echo "Bridge: ${BRIDGE_NAME}"
+echo "User:   ${SERVICE_USER}"
+echo "Install dir: ${INSTALL_DIR}"
+echo
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "[ERROR] Please run as root (sudo)."
+  exit 1
+fi
+
+# ensure service user exists
+if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
+  echo "[ERROR] Service user '${SERVICE_USER}' does not exist. Create the user first or edit SERVICE_USER."
+  exit 1
+fi
+
+# 0) backup existing installation if present
+if [ -d "${INSTALL_DIR}" ]; then
+  TS=$(date +%Y%m%d-%H%M%S)
+  BACKUP="/opt/${BRIDGE_NAME}.backup.${TS}"
+  echo "[INFO] Backing up existing ${INSTALL_DIR} -> ${BACKUP}"
+  mv "${INSTALL_DIR}" "${BACKUP}"
+fi
+
+# 1) apt update + install system deps (best-effort)
+echo "[1/8] apt update && apt install (best-effort)..."
+apt update -y
+set +e
+apt install -y "${PKGS[@]}"
+A_RES=$?
+set -e
+if [ $A_RES -ne 0 ]; then
+  echo "[WARN] apt install returned non-zero; continuing (installer is tolerant)."
+fi
+
+# 2) create install dir + venv
+echo "[2/8] Creating install dir and Python venv..."
+mkdir -p "${INSTALL_DIR}"
+chown "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}"
+chmod 750 "${INSTALL_DIR}"
+
+python3 -m venv "${VENV_DIR}"
+"${VENV_DIR}/bin/pip" install --upgrade pip setuptools wheel
+
+# 3) install python deps
+echo "[3/8] Installing Python packages into venv..."
+cat > "${REQ_FILE}" <<REQ
+meshtastic
+netifaces
+pypubsub
+paho-mqtt
+REQ
+
+"${VENV_DIR}/bin/pip" install -r "${REQ_FILE}"
+
+# 4) ensure joseph is in dialout
+echo "[4/8] Ensuring ${SERVICE_USER} is in 'dialout' group..."
+if id -nG "${SERVICE_USER}" | grep -qw "dialout"; then
+  echo " - ${SERVICE_USER} already in dialout"
+else
+  usermod -aG dialout "${SERVICE_USER}"
+  echo " - added ${SERVICE_USER} to dialout (re-login/reboot required for new sessions)"
+fi
+
+# 5) write bridge.py (with retry logic)
+echo "[5/8] Writing bridge.py to ${BRIDGE_PY} (backup saved if file existed)..."
+
+cat > "${BRIDGE_PY}" <<'PY'
+#!/usr/bin/env python3
+"""
+tak22 bridge (TAK -> Meshtastic minimal location bridge)
+Includes robust serial open retry logic and tolerant CLI provisioning.
+"""
+from __future__ import annotations
+import os, sys, time, uuid, glob, socket, struct, logging, threading, xml.etree.ElementTree as ET
+import datetime as dt, json
+
+HOSTNAME = os.uname().nodename
+MYCALL = HOSTNAME
+BRIDGE_NAME = os.getenv("BRIDGE_NAME", "tak22")
+
+INSTALL_BASE = f"/opt/{BRIDGE_NAME}"
+VENV_BIN = os.path.join(INSTALL_BASE, "venv", "bin")
+MESHTASTIC_CLI = os.path.join(VENV_BIN, "meshtastic")
+
+TAK_IP = "239.2.3.1"
+TAK_PORT = 6969
+CHANNEL_INDEX = 1
+
+# retry settings for opening serial port
+SERIAL_OPEN_RETRY_COUNT = int(os.getenv("SERIAL_OPEN_RETRY_COUNT", "15"))
+SERIAL_OPEN_RETRY_DELAY = float(os.getenv("SERIAL_OPEN_RETRY_DELAY", "1.0"))
+
+# retry settings for CLI provisioning
+CLI_SET_RETRY_COUNT = int(os.getenv("CLI_SET_RETRY_COUNT", "6"))
+CLI_SET_RETRY_DELAY = float(os.getenv("CLI_SET_RETRY_DELAY", "1.0"))
+
+# sweep settings
+SWEEP_INTERVAL_SECONDS = int(os.getenv("SWEEP_INTERVAL_SECONDS","300"))  # 5 minutes
+NODE_STALE_SECONDS = int(os.getenv("NODE_STALE_SECONDS","300"))        # nodes go away after 5 minutes
+
+# globals
+node_registry = {}
+bridge_stop = threading.Event()
+bridge_iface = None
+bridge_iface_lock = threading.Lock()
+self_sent_ips = set()
+LOCAL_IP = None
+
+# logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("tak22")
+
+# optional imports
+try:
+    import meshtastic.serial_interface as meshtastic_serial
+    import pubsub.pub as pubsub
+except Exception:
+    meshtastic_serial = None
+    pubsub = None
+
+try:
+    import netifaces
+except Exception:
+    netifaces = None
+
+# create sockets
+tak_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+tak_recv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+tak_recv.bind(("", TAK_PORT))
+tak_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+
+def now_utc(): return dt.datetime.utcnow()
+def fmt_time(t): return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def determine_local_ip():
+    global LOCAL_IP
+    if netifaces:
+        try:
+            gw = netifaces.gateways().get("default", {}).get(netifaces.AF_INET)
+            if gw and gw[1]:
+                iface = gw[1]
+                LOCAL_IP = netifaces.ifaddresses(iface)[netifaces.AF_INET][0]["addr"]
+        except Exception:
+            LOCAL_IP = None
+    if not LOCAL_IP:
+        try:
+            LOCAL_IP = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            LOCAL_IP = None
+    log.info("Detected LOCAL_IP=%s", LOCAL_IP)
+
+determine_local_ip()
+
+def join_multicast():
+    try:
+        if LOCAL_IP:
+            mreq = struct.pack("4s4s", socket.inet_aton(TAK_IP), socket.inet_aton(LOCAL_IP))
+            tak_recv.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            log.info("Joined TAK multicast on %s", LOCAL_IP)
+            return
+    except Exception:
+        pass
+    try:
+        mreq = struct.pack("4s4s", socket.inet_aton(TAK_IP), socket.inet_aton("0.0.0.0"))
+        tak_recv.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        log.info("Joined TAK multicast on INADDR_ANY")
+    except Exception as e:
+        log.error("Failed to join TAK multicast: %s", e)
+
+join_multicast()
+
+def build_cot(uid, lat, lon, alt, callsign=None, time_val=None, stale_seconds=60):
+    if time_val is None: time_val = now_utc()
+    stale = time_val + dt.timedelta(seconds=stale_seconds)
+    e = ET.Element("event", {
+        "version":"2.0", "uid":str(uid), "type":"a-f-G-U-C", "how":"m-g",
+        "time":fmt_time(time_val), "start":fmt_time(time_val), "stale":fmt_time(stale)
+    })
+    ET.SubElement(e, "point", {"lat":str(lat), "lon":str(lon), "hae":str(alt), "ce":"9999999.0", "le":"9999999.0"})
+    detail = ET.SubElement(e, "detail")
+    ET.SubElement(detail, "contact", {"callsign":callsign or str(uid)})
+    return ET.tostring(e)
+
+def print_cot(label, data):
+    try:
+        s = data.decode("utf-8","ignore") if isinstance(data,(bytes,bytearray)) else str(data)
+        root = ET.fromstring(s)
+        uid = root.attrib.get("uid","?")
+        pt = root.find("point")
+        contact = root.find("detail/contact")
+        callsign = contact.attrib.get("callsign", uid) if contact is not None else uid
+        lat = pt.attrib.get("lat","?") if pt is not None else "?"
+        lon = pt.attrib.get("lon","?") if pt is not None else "?"
+        alt = pt.attrib.get("hae","?") if pt is not None else "?"
+        log.info("[%s] [%s] Callsign=%s UID=%s Lat=%s Lon=%s Alt=%s", now_utc().strftime("%H:%M:%S"), label, callsign, uid, lat, lon, alt)
+    except Exception:
+        log.exception("print_cot parse error")
+
+def find_serial_port():
+    cand = sorted(glob.glob("/dev/serial/by-id/*")) + sorted(glob.glob("/dev/ttyUSB*")) + sorted(glob.glob("/dev/ttyACM*"))
+    return cand[0] if cand else None
+
+def update_node_registry(uid, lat, lon, alt, callsign=None, src="tak", src_ip=None):
+    try:
+        uid = str(uid)
+        now = now_utc()
+        e = node_registry.get(uid)
+        if not e:
+            node_registry[uid] = {"uid":uid,"callsign":callsign or uid,"lat":lat,"lon":lon,"alt":alt,"last_seen":now,"ip":src_ip,"sources":set([src])}
+            log.debug("Added node %s ip=%s", uid, src_ip)
+        else:
+            e["lat"]=lat; e["lon"]=lon; e["alt"]=alt; e["last_seen"]=now
+            if src_ip:
+                e["ip"]=src_ip
+            e["sources"].add(src)
+            log.debug("Updated node %s ip=%s", uid, src_ip)
+    except Exception:
+        log.exception("update_node_registry error")
+
+def send_node_to_mesh(iface, uid, lat, lon, alt, callsign=None, channelIndex=CHANNEL_INDEX):
+    uid = str(uid)
+    csv = f"{uid},{lat},{lon},{alt},{callsign or uid}@{HOSTNAME}"
+    payload = {"uid":uid,"callsign":callsign or uid,"host":HOSTNAME,"lat":float(lat),"lon":float(lon),"alt":float(alt),"ts":now_utc().isoformat()+"Z"}
+    payload_json = json.dumps(payload)
+    if iface:
+        try:
+            if hasattr(iface, "sendPosition"):
+                iface.sendPosition(float(lat), float(lon), float(alt))
+            else:
+                iface.sendText(csv, channelIndex=channelIndex)
+                iface.sendText(payload_json, channelIndex=channelIndex)
+            log.debug("Sent to mesh: %s", csv)
+        except Exception:
+            log.exception("send_node_to_mesh failed")
+    else:
+        log.debug("No iface available to send to mesh")
+
+# tolerant CLI provisioning with retries
+def run_cli_set(key, value):
+    if not os.path.exists(MESHTASTIC_CLI):
+        log.debug("meshtastic CLI not found at %s; skipping CLI set", MESHTASTIC_CLI)
+        return False
+    for attempt in range(CLI_SET_RETRY_COUNT):
+        try:
+            import subprocess
+            subprocess.run([MESHTASTIC_CLI, "--set", key, str(value)], check=True)
+            log.info("meshtastic --set %s succeeded (attempt %d)", key, attempt+1)
+            return True
+        except Exception as e:
+            log.warning("meshtastic --set %s attempt %d/%d failed: %s", key, attempt+1, CLI_SET_RETRY_COUNT, e)
+            time.sleep(CLI_SET_RETRY_DELAY)
+    log.warning("meshtastic --set %s failed after retries", key)
+    return False
+
+# TAK listener (converts CoT -> mesh)
+def tak_listener_loop():
+    global bridge_iface
+    log.info("TAK listener started")
+    while not bridge_stop.is_set():
+        try:
+            tak_recv.settimeout(1.0)
+            data, addr = tak_recv.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except OSError:
+            if bridge_stop.is_set():
+                break
+            continue
+        if not data:
+            continue
+        src_ip = addr[0] if isinstance(addr, (list,tuple)) else None
+        if src_ip and (src_ip == LOCAL_IP or src_ip in self_sent_ips):
+            log.debug("Ignoring TAK packet from self %s", src_ip)
+            continue
+        print_cot("TAK->MESH", data)
+        try:
+            root = ET.fromstring(data.decode("utf-8","ignore"))
+        except Exception:
+            continue
+        if root.tag != "event":
+            continue
+        uid = root.attrib.get("uid", f"tak-{uuid.uuid4()}")
+        pt = root.find("point")
+        contact = root.find("detail/contact")
+        callsign = contact.attrib.get("callsign") if contact is not None else uid
+        if pt is None:
+            continue
+        lat = pt.attrib.get("lat"); lon = pt.attrib.get("lon"); alt = pt.attrib.get("hae","0")
+        update_node_registry(uid, lat, lon, alt, callsign=callsign, src="tak", src_ip=src_ip)
+        with bridge_iface_lock:
+            iface = bridge_iface
+        send_node_to_mesh(iface, uid, lat, lon, alt, callsign=callsign, channelIndex=CHANNEL_INDEX)
+
+# sweep loop: send nodes to TAK with stale=NODE_STALE_SECONDS
+def sweep_loop():
+    log.info("Sweep thread running: interval=%s, stale=%s", SWEEP_INTERVAL_SECONDS, NODE_STALE_SECONDS)
+    while not bridge_stop.is_set():
+        try:
+            now = now_utc()
+            cutoff = now - dt.timedelta(seconds=NODE_STALE_SECONDS)
+            for uid, e in list(node_registry.items()):
+                if e.get("last_seen") and e["last_seen"] >= cutoff:
+                    cot = build_cot(uid, e["lat"], e["lon"], e.get("alt","0"), callsign=e.get("callsign"), stale_seconds=NODE_STALE_SECONDS)
+                    try:
+                        tak_send.sendto(cot, (TAK_IP, TAK_PORT))
+                        if LOCAL_IP:
+                            self_sent_ips.add(LOCAL_IP)
+                        print_cot("SWEEP->TAK", cot)
+                    except Exception:
+                        log.exception("Failed sending sweep CoT")
+            # prune older than 2x stale
+            prune_cutoff = now - dt.timedelta(seconds=NODE_STALE_SECONDS*2)
+            for uid, e in list(node_registry.items()):
+                if e.get("last_seen") and e["last_seen"] < prune_cutoff:
+                    node_registry.pop(uid, None)
+            time.sleep(SWEEP_INTERVAL_SECONDS)
+        except Exception:
+            log.exception("sweep_loop error")
+            time.sleep(5)
+
+def start_bridge():
+    global bridge_iface
+    port = find_serial_port()
+    if port and meshtastic_serial:
+        log.info("Attempting to open serial interface on %s (retry %d x %.1fs)", port, SERIAL_OPEN_RETRY_COUNT, SERIAL_OPEN_RETRY_DELAY)
+        iface_obj = None
+        for attempt in range(SERIAL_OPEN_RETRY_COUNT):
+            try:
+                iface_obj = meshtastic_serial.SerialInterface(port)
+                log.info("Opened serial interface on %s (attempt %d)", port, attempt+1)
+                break
+            except Exception as e:
+                log.warning("Serial open attempt %d/%d failed: %s", attempt+1, SERIAL_OPEN_RETRY_COUNT, e)
+                time.sleep(SERIAL_OPEN_RETRY_DELAY)
+        if iface_obj is None:
+            log.error("Could not open SerialInterface after %d attempts; running without iface", SERIAL_OPEN_RETRY_COUNT)
+            with bridge_iface_lock:
+                bridge_iface = None
+        else:
+            with bridge_iface_lock:
+                bridge_iface = iface_obj
+            # try CLI provisioning (best-effort)
+            run_cli_set("position.position_broadcast_secs", NODE_STALE_SECONDS)
+            run_cli_set("position.position_broadcast_smart_enabled", "false")
+    else:
+        log.info("No serial iface available (either device missing or meshtastic python unavailable).")
+
+    t1 = threading.Thread(target=tak_listener_loop, daemon=True)
+    t2 = threading.Thread(target=sweep_loop, daemon=True)
+    t1.start(); t2.start()
+    log.info("Bridge running (press Ctrl-C to stop in foreground)")
+
+    try:
+        while not bridge_stop.is_set():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("Keyboard interrupt -> stopping bridge")
+        bridge_stop.set()
+    finally:
+        with bridge_iface_lock:
+            if bridge_iface is not None:
+                try:
+                    bridge_iface.close()
+                    log.info("Serial interface closed")
+                except Exception:
+                    log.exception("Error closing serial interface")
+                bridge_iface = None
+        time.sleep(0.2)
+
+if __name__ == "__main__":
+    log.info("Starting tak22 bridge (TAK -> Meshtastic) MYCALL=%s", MYCALL)
+    start_bridge()
+PY
+
+chown "${SERVICE_USER}:${SERVICE_USER}" "${BRIDGE_PY}"
+chmod 750 "${BRIDGE_PY}"
+
+# 6) create wrapper
+echo "[6/8] Creating wrapper ${WRAPPER}..."
+cat > "${WRAPPER}" <<WRAP
+#!/usr/bin/env bash
+export BRIDGE_NAME="${BRIDGE_NAME}"
+exec "${VENV_DIR}/bin/python" "${BRIDGE_PY}" "\$@"
+WRAP
+chmod 755 "${WRAPPER}"
+chown root:root "${WRAPPER}"
+
+# 7) create systemd unit
+echo "[7/8] Creating systemd unit ${SERVICE_FILE}..."
+cat > "${SERVICE_FILE}" <<SERVICE
+[Unit]
+Description=tak22 TAK -> Meshtastic bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+WorkingDirectory=${INSTALL_DIR}
+Environment=BRIDGE_NAME=${BRIDGE_NAME}
+Environment=PATH=${VENV_DIR}/bin:/usr/bin:/bin
+ExecStart=${VENV_DIR}/bin/python ${BRIDGE_PY}
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+
+# enable & start by default
+echo "[8/8] Enabling and starting ${BRIDGE_NAME}.service..."
+systemctl enable --now "${BRIDGE_NAME}.service"
+
+# 8) autostart helper
+echo "Creating autostart helper ${AUTOSTART_HELPER}..."
+cat > "${AUTOSTART_HELPER}" <<'AUT'
+#!/usr/bin/env bash
+# tak22-autostart: control tak22 service enable/disable/status
+CMD="$1"
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Usage: sudo $0 {enable|disable|status|start|stop|restart}"
+  exit 1
+fi
+case "$CMD" in
+  enable) systemctl enable tak22.service && systemctl start tak22.service;;
+  disable) systemctl stop tak22.service && systemctl disable tak22.service;;
+  status) systemctl status tak22.service --no-pager;;
+  start) systemctl start tak22.service;;
+  stop) systemctl stop tak22.service;;
+  restart) systemctl restart tak22.service;;
+  *) echo "Usage: sudo $0 {enable|disable|status|start|stop|restart}"; exit 2;;
+esac
+AUT
+chmod 755 "${AUTOSTART_HELPER}"
+
+echo
+echo "Installation complete."
+echo " - Bridge script: ${BRIDGE_PY}"
+echo " - Wrapper: ${WRAPPER}"
+echo " - Service: ${SERVICE_FILE} (enabled & started)"
+echo " - Autostart helper: ${AUTOSTART_HELPER} (run with sudo, eg: sudo ${BRIDGE_NAME}-autostart status)"
+echo
+echo "If the serial port is grabbed by another process you can:"
+echo " - stop the service: sudo ${BRIDGE_NAME}-autostart stop"
+echo " - check what's using it: sudo lsof -n /dev/ttyUSB0"
+echo " - kill the process after inspection"
+echo
+echo "NOTE: You may need to log out and log in (or reboot) for group membership changes to take effect for user '${SERVICE_USER}'."
